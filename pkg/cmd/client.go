@@ -1,452 +1,500 @@
-package cmd
+package camo
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
-	"expvar"
-	"flag"
 	"fmt"
-	"hash/crc32"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
-	"os"
-	"os/signal"
-	"runtime"
+	"net/url"
+	"strconv"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"time"
 
-	"github.com/linfn/camo/pkg/camo"
-	"github.com/linfn/camo/pkg/env"
-	"github.com/linfn/camo/pkg/machineid"
-	"github.com/linfn/camo/pkg/util"
+	"github.com/lucas-clemente/quic-go"
+	"github.com/lucas-clemente/quic-go/http3"
+	"golang.org/x/net/http2"
+)
+
+const (
+	defaultClientIfaceWriteChanLen  = 256
+	defaultClientTunnelWriteChanLen = 256
 )
 
 // Client ...
 type Client struct {
-	flags *flag.FlagSet
+	MTU       int
+	CID       string
+	Host      string
+	Dial      func(network, addr string) (net.Conn, error)
+	TLSConfig *tls.Config
+	URLPrefix string
+	Auth      func(r *http.Request)
+	Logger    Logger
+	UseH2C    bool
+	UseH3     bool
+	Noise     int
 
-	help             bool
-	host             string
-	password         string
-	tun4             bool
-	tun6             bool
-	resolve          string
-	resolve4         bool
-	resolve6         bool
-	usePSK           bool
-	mtu              int
-	disableReGateway bool
-	logLevel         string
-	useH2C           bool
-	useH3            bool
-	debugHTTP        string
+	mu               sync.Mutex
+	bufPool          sync.Pool
+	ifaceWriteChan   chan *packetBuffer
+	tunnel4WriteChan chan *packetBuffer
+	tunnel6WriteChan chan *packetBuffer
 
-	log        camo.Logger
-	remoteAddr atomic.Value
+	hc *http.Client
+
+	metrics     *Metrics
+	metricsOnce sync.Once
 }
 
-func (cmd *Client) flagSet() *flag.FlagSet {
-	if cmd.flags != nil {
-		return cmd.flags
+func (c *Client) getIfaceWriteChan() chan *packetBuffer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ifaceWriteChan == nil {
+		c.ifaceWriteChan = make(chan *packetBuffer, defaultClientIfaceWriteChanLen)
 	}
-
-	fs := flag.NewFlagSet("client", flag.ExitOnError)
-
-	fs.BoolVar(&cmd.help, "h", false, "help")
-	fs.StringVar(&cmd.password, "password", env.String("CAMO_PASSWORD", ""), "Set a password. It is recommended to use the environment variable CAMO_PASSWORD to set the password.")
-	fs.BoolVar(&cmd.tun4, "4", env.Bool("CAMO_ENABLE_IP4", false), "tunneling for IPv4")
-	fs.BoolVar(&cmd.tun6, "6", env.Bool("CAMO_ENABLE_IP6", false), "tunneling for IPv6")
-	fs.StringVar(&cmd.resolve, "resolve", env.String("CAMO_RESOLVE", ""), "provide a custom address for a specific host and port pair")
-	fs.BoolVar(&cmd.resolve4, "resolve4", env.Bool("CAMO_RESOLVE4", false), "resolve host name to IPv4 addresses only")
-	fs.BoolVar(&cmd.resolve6, "resolve6", env.Bool("CAMO_RESOLVE6", false), "resolve host name to IPv6 addresses only")
-	fs.BoolVar(&cmd.usePSK, "psk", env.Bool("CAMO_PSK", false), "use TLS 1.3 PSK mode")
-	fs.IntVar(&cmd.mtu, "mtu", env.Int("CAMO_MTU", camo.DefaultMTU), "mtu")
-	fs.BoolVar(&cmd.disableReGateway, "disable-redirect-gateway", env.Bool("CAMO_DISABLE_REDIRECT_GATEWAY", false), "dsiable redirect gateway")
-	fs.StringVar(&cmd.logLevel, "log-level", env.String("CAMO_LOG_LEVEL", camo.LogLevelTexts[camo.LogLevelInfo]), "log level")
-	fs.BoolVar(&cmd.useH2C, "h2c", env.Bool("CAMO_H2C", false), "use h2c (for debug)")
-	fs.BoolVar(&cmd.useH3, "http3", env.Bool("CAMO_HTTP3", false), "use http3/quic")
-	fs.StringVar(&cmd.debugHTTP, "debug-http", env.String("CAMO_DEBUG_HTTP", ""), "debug http server listen address")
-
-	cmd.flags = fs
-	return fs
+	return c.ifaceWriteChan
 }
 
-func (cmd *Client) Name() string {
-	return "client"
+func (c *Client) getTunnel4WriteChan() chan *packetBuffer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tunnel4WriteChan == nil {
+		c.tunnel4WriteChan = make(chan *packetBuffer, defaultClientTunnelWriteChanLen)
+	}
+	return c.tunnel4WriteChan
 }
 
-func (cmd *Client) Desc() string {
-	return "Connect to camo server"
+func (c *Client) getTunnel6WriteChan() chan *packetBuffer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tunnel6WriteChan == nil {
+		c.tunnel6WriteChan = make(chan *packetBuffer, defaultClientTunnelWriteChanLen)
+	}
+	return c.tunnel6WriteChan
 }
 
-func (cmd *Client) Usage() {
-	fmt.Printf("Usage: camo client [OPTIONS] <host>\n")
-	cmd.flagSet().PrintDefaults()
+func (c *Client) mtu() int {
+	if c.MTU <= 0 {
+		return DefaultMTU
+	}
+	return c.MTU
 }
 
-func (cmd *Client) parseFlags(args []string) {
-	fs := cmd.flagSet()
-
-	_ = fs.Parse(args)
-	if cmd.help {
-		return
-	}
-
-	log := newLogger(cmd.logLevel)
-	cmd.log = log
-
-	cmd.host = fs.Arg(0)
-	if cmd.host == "" {
-		cmd.host = os.Getenv("CAMO_HOST")
-		if cmd.host == "" {
-			log.Fatal("missing host")
-		}
-	}
-
-	if !cmd.tun4 && !cmd.tun6 {
-		cmd.tun4 = true
-		cmd.tun6 = true
-	}
-
-	if cmd.resolve4 && cmd.resolve6 {
-		log.Fatal("can not use -resolve4 and -resolve6 at the same time")
-	}
-
-	if cmd.resolve != "" {
-		addr, err := util.GetHostPortAddr(cmd.resolve, "443")
-		if err != nil {
-			log.Fatalf("resolve addr %s error: %v", cmd.resolve, err)
-		}
-		cmd.resolve = addr
-	}
-
-	if cmd.usePSK && cmd.useH2C {
-		log.Fatal("cannot use both psk mode and h2c mode")
-	}
-
-	if cmd.password == "" {
-		log.Fatal("missing password")
-	}
-	hiddenPasswordArg()
-}
-
-func (cmd *Client) Run(args ...string) {
-	cmd.parseFlags(args)
-	if cmd.help {
-		cmd.Usage()
-		return
-	}
-
-	log := cmd.log
-	cid := cmd.getCID(cmd.host)
-
-	iface, err := camo.NewTunIface(cmd.mtu)
-	if err != nil {
-		log.Panicf("failed to create tun device: %v", err)
-	}
-	defer iface.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	c := &camo.Client{
-		MTU:       cmd.mtu,
-		CID:       cid,
-		Host:      cmd.host,
-		TLSConfig: cmd.initTLSConfig(),
-		Dial: func(network, addr string) (net.Conn, error) {
-			if cmd.resolve4 {
-				switch network {
-				case "tcp":
-					network = "tcp4"
-				case "udp":
-					network = "udp4"
-				}
-			} else if cmd.resolve6 {
-				switch network {
-				case "tcp":
-					network = "tcp6"
-				case "udp":
-					network = "udp6"
-				}
-			}
-			if cmd.resolve != "" {
-				addr = cmd.resolve
-			}
-			var d net.Dialer
-			conn, err := d.DialContext(ctx, network, addr)
-			if err == nil {
-				cmd.remoteAddr.Store(conn.RemoteAddr())
-				log.Infof("connection succeeded. remote: %s", conn.RemoteAddr())
-			}
-			return conn, err
-		},
-		Auth:   func(r *http.Request) { camo.SetAuth(r, cmd.password) },
-		Logger: log,
-		UseH2C: cmd.useH2C,
-		UseH3:  cmd.useH3,
-		Noise:  cmd.getNoise(cid),
-	}
-
-	expvar.Publish("camo", c.Metrics())
-
-	go func() {
-		cmd := make(chan os.Signal, 1)
-		signal.Notify(cmd, os.Interrupt, syscall.SIGTERM)
-		log.Debugf("receive signal %s", <-cmd)
-		cancel()
-	}()
-
-	if cmd.debugHTTP != "" {
-		go cmd.debugHTTPServer()
-	}
-
-	cmd.runClient(ctx, c, iface)
-}
-
-func (cmd *Client) getCID(host string) string {
-	mid, err := machineid.MachineID(camoDir)
-	if err != nil {
-		cmd.log.Panic(err)
-	}
-	mac := hmac.New(sha256.New, []byte(mid))
-	_, err = mac.Write([]byte("camo@" + host))
-	if err != nil {
-		cmd.log.Panic(err)
-	}
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-func (cmd *Client) initTLSConfig() *tls.Config {
-	tlsCfg := new(tls.Config)
-	tlsCfg.ServerName = util.StripPort(cmd.host)
-	if cmd.usePSK {
-		cs, err := camo.NewTLSPSKSessionCache(tlsCfg.ServerName, camo.NewSessionTicketKey(cmd.password))
-		if err != nil {
-			cmd.log.Panicf("failed to init TLS PSK session: %v", err)
-		}
-		tlsCfg.ClientSessionCache = cs
+func (c *Client) getBuffer() (p *packetBuffer) {
+	v := c.bufPool.Get()
+	if v != nil {
+		p = v.(*packetBuffer)
+		c.Metrics().Buffer.FreeBytes.Add(-int64(cap(p.Data)))
 	} else {
-		tlsCfg.ClientSessionCache = tls.NewLRUClientSessionCache(0)
+		p = &packetBuffer{Data: make([]byte, c.mtu())}
+		c.Metrics().Buffer.TotalBytes.Add(int64(cap(p.Data)))
 	}
-	return tlsCfg
+	return p
 }
 
-func (cmd *Client) getNoise(cid string) int {
-	return int(crc32.ChecksumIEEE([]byte(cid)))
+func (c *Client) freeBuffer(p *packetBuffer) {
+	p.Reset()
+	c.bufPool.Put(p)
+	c.Metrics().Buffer.FreeBytes.Add(int64(cap(p.Data)))
 }
 
-func (cmd *Client) setupTun(iface *camo.Iface, tunIP net.IP, mask net.IPMask, gateway net.IP) (reset func(), err error) {
-	log := cmd.log
+func (c *Client) logger() Logger {
+	if c.Logger == nil {
+		return (*LevelLogger)(nil)
+	}
+	return c.Logger
+}
 
-	var rollback util.Rollback
-	defer func() {
-		if err != nil {
-			rollback.Do()
+// Metrics ...
+func (c *Client) Metrics() *Metrics {
+	c.metricsOnce.Do(func() {
+		c.metrics = NewMetrics()
+	})
+	return c.metrics
+}
+
+// ServeIface ...
+func (c *Client) ServeIface(ctx context.Context, iface io.ReadWriteCloser) error {
+	var (
+		log     = c.logger()
+		metrics = c.Metrics()
+		rw      = WithIOMetric(iface, metrics.Iface)
+		tunnel4 = c.getTunnel4WriteChan()
+		tunnel6 = c.getTunnel6WriteChan()
+		bufpool = c
+	)
+	return serveIO(ctx, rw, bufpool, func(done <-chan struct{}, p *packetBuffer) (retainBuf bool) {
+		ver := GetIPPacketVersion(p.Data)
+
+		if log.Level() >= LogLevelTrace {
+			if ver == 4 {
+				log.Tracef("iface recv: %s", IPv4Header(p.Data))
+			} else {
+				log.Tracef("iface recv: %s", IPv6Header(p.Data))
+			}
 		}
-	}()
-	addRollback := func(f func() error) {
-		rollback.Add(func() { _ = f() })
+
+		var (
+			dstIP  net.IP
+			tunnel chan *packetBuffer
+		)
+		if ver == 4 {
+			dstIP = IPv4Header(p.Data).Dst()
+			tunnel = tunnel4
+		} else {
+			dstIP = IPv6Header(p.Data).Dst()
+			tunnel = tunnel6
+		}
+
+		if !dstIP.IsGlobalUnicast() {
+			log.Tracef("iface drop packet: not a global unicast, dstIP %s", dstIP)
+			return
+		}
+
+		select {
+		case tunnel <- p:
+			retainBuf = true
+			metrics.Tunnels.Lags.Add(1)
+			return
+		case <-done:
+			return
+		}
+	}, c.getIfaceWriteChan(), nil)
+}
+
+func (c *Client) serveTunnel(ctx context.Context, rw io.ReadWriteCloser, localIP net.IP) error {
+	metrics := c.Metrics().Tunnels
+
+	metrics.Streams.Add(1)
+	defer metrics.Streams.Add(-1)
+
+	rw = WithIOMetric(&packetIO{rw}, metrics.IOMetric)
+
+	var (
+		log             = c.logger()
+		ifaceWriteChan  = c.getIfaceWriteChan()
+		tunnelWriteChan chan *packetBuffer
+		postWrite       = func(<-chan struct{}, error) { metrics.Lags.Add(-1) }
+		bufpool         = c
+	)
+	if localIP.To4() != nil {
+		tunnelWriteChan = c.getTunnel4WriteChan()
+	} else {
+		tunnelWriteChan = c.getTunnel6WriteChan()
+	}
+	return serveIO(ctx, rw, bufpool, func(done <-chan struct{}, p *packetBuffer) (retainBuf bool) {
+		ver := GetIPPacketVersion(p.Data)
+
+		if log.Level() >= LogLevelTrace {
+			if ver == 4 {
+				log.Tracef("tunnel recv: %s", IPv4Header(p.Data))
+			} else {
+				log.Tracef("tunnel recv: %s", IPv6Header(p.Data))
+			}
+		}
+
+		var dstIP net.IP
+		if ver == 4 {
+			dstIP = IPv4Header(p.Data).Dst()
+		} else {
+			dstIP = IPv6Header(p.Data).Dst()
+		}
+
+		if !dstIP.Equal(localIP) {
+			log.Tracef("tunnel drop packet: dst %s mismatched", dstIP)
+			return
+		}
+
+		select {
+		case ifaceWriteChan <- p:
+			retainBuf = true
+			return
+		case <-done:
+			return
+		}
+	}, tunnelWriteChan, postWrite)
+}
+
+// hack for lucas-clemente/quic-go package
+type clientH3PacketConn struct {
+	net.PacketConn
+	io.ReadWriter
+	remoteAddr net.Addr
+}
+
+func (c *clientH3PacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	return c.ReadWriter.Write(b)
+}
+func (c *clientH3PacketConn) RemoteAddr() net.Addr {
+	return c.remoteAddr
+}
+
+func (c *Client) newTransport() (ts http.RoundTripper) {
+	// TODO Need a timing to refresh the cached server address (if the DNS results changed)
+	var (
+		mu           sync.Mutex
+		resolvedAddr net.Addr
+	)
+	dial := func(network, addr string) (conn net.Conn, err error) {
+		mu.Lock()
+		locked := true
+		if resolvedAddr != nil {
+			addr = resolvedAddr.String()
+			mu.Unlock()
+			locked = false
+		}
+		defer func() {
+			if locked {
+				mu.Unlock()
+			}
+		}()
+
+		dial := c.Dial
+		if dial == nil {
+			dial = net.Dial
+		}
+		conn, err = dial(network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		if locked {
+			resolvedAddr = conn.RemoteAddr()
+			mu.Unlock()
+			locked = false
+		}
+
+		if c.UseH3 {
+			conn = &clientH3PacketConn{conn.(net.PacketConn), conn, conn.RemoteAddr()}
+		}
+
+		return conn, err
+	}
+
+	if c.UseH3 {
+		return &http3.RoundTripper{
+			TLSClientConfig: c.TLSConfig,
+			Dial: func(network, addr string, tlsCfg *tls.Config, quicCfg *quic.Config) (quic.EarlySession, error) {
+				conn, err := dial(network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return quic.DialEarly(conn.(net.PacketConn), conn.RemoteAddr(), addr, tlsCfg, quicCfg)
+			},
+		}
+	}
+
+	return &http2.Transport{
+		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+			conn, err := dial(network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if !c.UseH2C {
+				cn := tls.Client(conn, cfg)
+				if err := cn.Handshake(); err != nil {
+					return nil, err
+				}
+				if !cfg.InsecureSkipVerify {
+					if err := cn.VerifyHostname(cfg.ServerName); err != nil {
+						return nil, err
+					}
+				}
+				state := cn.ConnectionState()
+				if p := state.NegotiatedProtocol; p != http2.NextProtoTLS {
+					return nil, fmt.Errorf("http2: unexpected ALPN protocol %q; want %q", p, http2.NextProtoTLS)
+				}
+				if !state.NegotiatedProtocolIsMutual {
+					return nil, errors.New("http2: could not negotiate protocol mutually")
+				}
+				conn = cn
+			}
+			return conn, nil
+		},
+		TLSClientConfig: c.TLSConfig,
+	}
+}
+
+func (c *Client) httpClient() *http.Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.hc != nil {
+		return c.hc
+	}
+	c.hc = &http.Client{
+		Transport: c.newTransport(),
+	}
+	return c.hc
+}
+
+func (c *Client) url(path string) *url.URL {
+	return &url.URL{
+		Scheme: "https",
+		Host:   c.Host,
+		Path:   c.URLPrefix + path,
+	}
+}
+
+func (c *Client) setAuth(r *http.Request) {
+	if c.Auth != nil {
+		c.Auth(r)
+	}
+}
+
+func (c *Client) setNoise(r *http.Request) {
+	if c.Noise != 0 {
+		r.Header.Set(headerNoise, getNoisePadding(c.Noise, r.Method+r.URL.Path))
+	}
+}
+
+// ClientAPIError ...
+type ClientAPIError struct {
+	Err  error
+	temp bool
+}
+
+func (e *ClientAPIError) Error() string {
+	return e.Err.Error()
+}
+
+// Temporary ...
+func (e *ClientAPIError) Temporary() bool {
+	return e.temp
+}
+
+var testHookClientDoReq func(req *http.Request, res *http.Response, err error)
+
+func (c *Client) doReq(req *http.Request) (*http.Response, error) {
+	c.setAuth(req)
+	c.setNoise(req)
+
+	hc := c.httpClient()
+	res, err := hc.Do(req)
+	if testHookClientDoReq != nil {
+		testHookClientDoReq(req, res, err)
+	}
+	if err != nil {
+		return nil, &ClientAPIError{Err: err, temp: true}
+	}
+
+	if res.StatusCode != http.StatusOK {
+		var msg string
+		b, err := ioutil.ReadAll(res.Body)
+		msg = string(b)
+		if err != nil {
+			msg += "..+" + err.Error()
+		}
+		res.Body.Close()
+		return res, &ClientAPIError{
+			Err:  &statusError{res.StatusCode, msg},
+			temp: isStatusRetryable(res.StatusCode),
+		}
+	}
+
+	return res, nil
+}
+
+func (c *Client) requestIP(ctx context.Context, ipVersion int) (*IPResult, error) {
+	req := &http.Request{
+		Method: "POST",
+		URL:    c.url("/ip/v" + strconv.Itoa(ipVersion)),
+		Header: http.Header{
+			headerClientID: []string{c.CID},
+		},
+	}
+	res, err := c.doReq(req.WithContext(ctx))
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	var result struct {
+		IP       string `json:"ip"`
+		Notation int    `json:"notation"`
+		TTL      int    `json:"ttl"`
+		Gateway  string `json:"gateway"`
+	}
+	err = json.NewDecoder(res.Body).Decode(&result)
+	if err != nil {
+		temp := true
+		if _, ok := err.(*json.SyntaxError); ok {
+			temp = false
+		}
+		return nil, &ClientAPIError{Err: fmt.Errorf("failed to decode ip result, error: %s", err), temp: temp}
 	}
 
 	var (
-		cidr     = util.ToCIDR(tunIP, mask)
-		tunIPVer int
+		ip   = net.ParseIP(result.IP)
+		mask net.IPMask
+		gw   = net.ParseIP(result.Gateway)
 	)
-	if tunIP.To4() != nil {
-		tunIPVer = 4
-		if err = iface.SetIPv4(cidr); err != nil {
-			return nil, err
+	if ip == nil {
+		return nil, &ClientAPIError{Err: fmt.Errorf("failed to decode ip (%s)", result.IP), temp: false}
+	}
+	if ip.To4() != nil {
+		if result.Notation > 0 && result.Notation <= 32 {
+			mask = net.CIDRMask(result.Notation, 32)
+		} else {
+			mask = net.CIDRMask(32, 32)
 		}
-		addRollback(func() error { return iface.SetIPv4("") })
 	} else {
-		tunIPVer = 6
-		if err = iface.SetIPv6(cidr); err != nil {
-			return nil, err
+		if result.Notation > 0 && result.Notation <= 128 {
+			mask = net.CIDRMask(result.Notation, 128)
+		} else {
+			mask = net.CIDRMask(128, 128)
 		}
-		addRollback(func() error { return iface.SetIPv6("") })
-	}
-	log.Infof("%s(%s) up", iface.Name(), cidr)
-
-	if !cmd.disableReGateway {
-		// bypass tun for server ip
-		srvAddr, _ := cmd.remoteAddr.Load().(net.Addr)
-		if srvAddr == nil {
-			return nil, errors.New("failed to get server address")
-		}
-		srvIP, _, err := net.SplitHostPort(srvAddr.String())
-		if err != nil {
-			return nil, fmt.Errorf("failed to get server ip: %v (%s)", err, srvAddr)
-		}
-		srvIPVer := 4
-		if !util.IsIPv4(srvIP) {
-			srvIPVer = 6
-		}
-		if srvIPVer == tunIPVer {
-			oldGateway, oldDev, err := camo.GetRoute(srvIP)
-			if err != nil {
-				return nil, err
-			}
-			err = camo.AddRoute(srvIP, oldGateway, oldDev)
-			if err != nil {
-				return nil, err
-			}
-			addRollback(func() error { return camo.DelRoute(srvIP, oldGateway, oldDev) })
-		}
-
-		resetGateway, err := camo.RedirectGateway(iface.Name(), gateway.String())
-		if err != nil {
-			return nil, err
-		}
-		addRollback(resetGateway)
 	}
 
-	return rollback.Do, nil
+	return &IPResult{ip, mask, time.Duration(result.TTL) * time.Second, gw}, nil
 }
 
-func (cmd *Client) runClient(ctx context.Context, c *camo.Client, iface *camo.Iface) {
-	log := cmd.log
-
-	createTunnel := func(ctx context.Context, ipVersion int) (func(context.Context) error, error) {
-		var err error
-
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-
-		var res *camo.IPResult
-		if ipVersion == 4 {
-			res, err = c.RequestIPv4(ctx)
-		} else {
-			res, err = c.RequestIPv6(ctx)
-		}
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-
-		log.Infof("client get %s", res)
-
-		var (
-			ip   = res.IP
-			mask = res.Mask
-			gw   = res.Gateway
-		)
-
-		tunnel, err := c.CreateTunnel(ctx, ip)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-
-		cancel()
-
-		var reset func()
-		if ipVersion == 4 && runtime.GOOS == "darwin" {
-			reset, err = cmd.setupTun(iface, ip, mask, ip)
-		} else {
-			reset, err = cmd.setupTun(iface, ip, mask, gw)
-		}
-		if err != nil {
-			_ = tunnel(ctx) // use a canceled ctx to terminate the tunnel
-			return nil, fmt.Errorf("setup tunnel error: %v", err)
-		}
-
-		return func(ctx context.Context) error {
-			defer reset()
-			return tunnel(ctx)
-		}, nil
-	}
-
-	tunneld := func(ctx context.Context, ipVersion int) {
-		firstRound := true
-		for {
-			tunnel, err := createTunnel(ctx, ipVersion)
-			if ctx.Err() != nil {
-				break
-			}
-			if err != nil {
-				log.Errorf("failed to create IPv%d tunnel: %v", ipVersion, err)
-				if ae, ok := err.(*camo.ClientAPIError); ok {
-					if !firstRound || ae.Temporary() {
-						goto RETRY
-					}
-				}
-				break
-			}
-
-			log.Infof("IPv%d tunnel created", ipVersion)
-
-			err = tunnel(ctx)
-			if ctx.Err() != nil {
-				log.Infof("IPv%d tunnel closed", ipVersion)
-				break
-			}
-			log.Errorf("IPv%d tunnel closed: %v", ipVersion, err)
-
-			firstRound = false
-
-		RETRY:
-			if ctx.Err() != nil {
-				break
-			}
-			// TODO exponential backoff
-			time.Sleep(1 * time.Second)
-		}
-
-		if ctx.Err() == nil {
-			log.Errorf("IPv%d tunnel thread exited", ipVersion)
-		}
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-	exit := cancel
-
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		err := c.ServeIface(ctx, iface)
-		if ctx.Err() != nil {
-			return
-		}
-		log.Errorf("serve iface exited: %v", err)
-		exit()
-	}()
-
-	var tunWG sync.WaitGroup
-
-	if cmd.tun4 {
-		tunWG.Add(1)
-		go func() {
-			tunneld(ctx, 4)
-			tunWG.Done()
-		}()
-	}
-
-	if cmd.tun6 {
-		tunWG.Add(1)
-		go func() {
-			tunneld(ctx, 6)
-			tunWG.Done()
-		}()
-	}
-
-	tunWG.Wait()
-	if ctx.Err() == nil {
-		exit()
-	}
-
-	wg.Wait()
+// RequestIPv4 ...
+func (c *Client) RequestIPv4(ctx context.Context) (*IPResult, error) {
+	return c.requestIP(ctx, 4)
 }
 
-func (cmd *Client) debugHTTPServer() {
-	err := http.ListenAndServe(cmd.debugHTTP, nil)
-	if err != http.ErrServerClosed {
-		cmd.log.Errorf("debug http server exited: %v", err)
+// RequestIPv6 ...
+func (c *Client) RequestIPv6(ctx context.Context) (*IPResult, error) {
+	return c.requestIP(ctx, 6)
+}
+
+type httpClientStream struct {
+	io.ReadCloser
+	io.WriteCloser
+}
+
+func (s *httpClientStream) Close() error {
+	err1 := s.ReadCloser.Close()
+	err2 := s.WriteCloser.Close()
+	if err1 != nil {
+		return err1
 	}
+	return err2
+}
+
+// CreateTunnel ...
+func (c *Client) CreateTunnel(ctx context.Context, ip net.IP) (tunnel func(context.Context) error, err error) {
+	r, w := io.Pipe()
+	req := &http.Request{
+		Method: "POST",
+		URL:    c.url("/tunnel/" + ip.String()),
+		Header: http.Header{
+			headerClientID: []string{c.CID},
+		},
+		Body: ioutil.NopCloser(r),
+	}
+	// TODO 这里不能直接使用 ctx 作为 req 的 Context, 我们需要保持 req.Body 和 res.Body 组成的双向流
+	res, err := c.doReq(req.WithContext(context.TODO()))
+	if err != nil {
+		w.Close()
+		return
+	}
+	return func(ctx context.Context) error {
+		return c.serveTunnel(ctx, &httpClientStream{res.Body, w}, ip)
+	}, nil
 }
